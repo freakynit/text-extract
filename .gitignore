@@ -1,0 +1,5 @@
+target/
+.idea
+**/.DS_Store
+logs
+src/main/java/com/freakynit/Main.java
