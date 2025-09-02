@@ -1,68 +1,87 @@
 package com.freakynit.text.extract;
 
 import java.util.*;
+import java.util.regex.Pattern;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.core.type.TypeReference;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
 
 public class TextExtract {
+    // Expanded list of tags to skip
     private static final Set<String> SKIPPED_TAGS = new HashSet<>(Arrays.asList(
             "img", "video", "audio", "script", "style", "nav", "button", "aside",
-            "iframe", "embed", "object", "param", "link",
-            "base", "track", "source", "noscript", "wbr"));
+            "iframe", "embed", "object", "param", "link", "base", "track", "source",
+            "noscript", "wbr", "header", "footer", "form", "input", "select", "textarea",
+            "label", "fieldset", "legend", "canvas", "svg", "map", "area", "meta",
+            "title", "head", "html", "body"
+    ));
 
-    // Set of heading tags
+    // Content area selectors (in priority order)
+    private static final String[] CONTENT_SELECTORS = {
+            "main", "article", "[role=main]", ".main-content", ".content",
+            ".post-content", ".entry-content", ".article-content", "#content",
+            "#main", ".container .content", ".page-content"
+    };
+
+    // Non-content class/id patterns
+    private static final Pattern[] NON_CONTENT_PATTERNS = {
+            Pattern.compile("(?i).*(nav|menu|sidebar|footer|header|banner|ad|advertisement|social|share|comment|related|recommendation).*"),
+            Pattern.compile("(?i).*(cookie|popup|modal|overlay|promo|subscribe).*")
+    };
+
     private static final Set<String> HEADING_TAGS = new HashSet<>(Arrays.asList(
             "h1", "h2", "h3", "h4", "h5", "h6"));
 
-    // Mapping of HTML tags to Markdown formatting
     private static final Map<String, String[]> MARKDOWN_FORMATTING = new HashMap<>();
     static {
-        // Format: {prefix, suffix}
+        // Use lowercase keys to avoid case sensitivity issues
         MARKDOWN_FORMATTING.put("strong", new String[]{"**", "**"});
         MARKDOWN_FORMATTING.put("b", new String[]{"**", "**"});
         MARKDOWN_FORMATTING.put("em", new String[]{"*", "*"});
         MARKDOWN_FORMATTING.put("i", new String[]{"*", "*"});
         MARKDOWN_FORMATTING.put("code", new String[]{"`", "`"});
-        MARKDOWN_FORMATTING.put("pre", new String[]{"```\n", "\n```"});
+        MARKDOWN_FORMATTING.put("pre", new String[]{"``````"});
         MARKDOWN_FORMATTING.put("blockquote", new String[]{"> ", ""});
-        MARKDOWN_FORMATTING.put("a", new String[]{"[", "]"});
     }
 
-    // A simple Node class representing an element.
     public static class Node {
-        public String tag;      // HTML tag name (e.g., "div", "p", etc.)
-        public String text;     // Text content (if any)
-        public List<Node> children; // Child nodes
+        public String tag;
+        public String text;
+        public List<Node> children;
+        public Map<String, String> attributes;
 
-        // Default constructor for Jackson.
         public Node() {
             this.children = new ArrayList<>();
+            this.attributes = new HashMap<>();
         }
 
         public Node(String tag) {
             this.tag = tag;
             this.children = new ArrayList<>();
+            this.attributes = new HashMap<>();
         }
     }
 
     /**
-     * Parses an HTML string into a tree of Nodes using jsoup.
+     * Improved HTML parsing with main content detection
      */
     public static Node parseHtml(String html) {
         if (html == null || html.trim().isEmpty()) {
             throw new IllegalArgumentException("HTML string cannot be null or empty");
         }
 
-        Node root = new Node("root");
         Document doc = Jsoup.parse(html);
-        Element body = doc.body();
-        if (body == null) {
+        Element contentArea = findMainContentArea(doc);
+
+        Node root = new Node("root");
+        if (contentArea == null) {
             return root;
         }
-        for (Element child : body.children()) {
+
+        for (Element child : contentArea.children()) {
             Node childNode = convertElement(child);
             if (childNode != null) {
                 root.children.add(childNode);
@@ -72,37 +91,146 @@ public class TextExtract {
     }
 
     /**
-     * Recursively converts a jsoup Element into a Node.
-     * Skips elements in the SKIPPED_TAGS set.
+     * Find the main content area using various heuristics
      */
+    private static Element findMainContentArea(Document doc) {
+        // Try semantic selectors first
+        for (String selector : CONTENT_SELECTORS) {
+            Elements elements = doc.select(selector);
+            if (!elements.isEmpty()) {
+                return elements.first();
+            }
+        }
+
+        // Fallback: find element with highest content density
+        Element body = doc.body();
+        if (body == null) return null;
+
+        Element bestCandidate = body;
+        double bestScore = calculateContentScore(body);
+
+        // Check direct children of body
+        for (Element child : body.children()) {
+            if (isNonContentElement(child)) continue;
+
+            double score = calculateContentScore(child);
+            if (score > bestScore) {
+                bestScore = score;
+                bestCandidate = child;
+            }
+        }
+
+        return bestCandidate;
+    }
+
+    /**
+     * Calculate content density score for an element
+     */
+    private static double calculateContentScore(Element element) {
+        if (element == null) return 0;
+
+        String text = element.text();
+        if (text.length() < 50) return 0; // Too short to be main content
+
+        // Factors that increase score
+        double score = text.length();
+
+        // Bonus for paragraphs and content tags
+        score += element.select("p").size() * 100;
+        score += element.select("article, main, .content").size() * 200;
+
+        // Penalty for navigation and non-content elements
+        score -= element.select("nav, aside, footer, header").size() * 150;
+        score -= element.select("script, style, form").size() * 200;
+
+        // Text-to-tag ratio bonus
+        int tagCount = element.select("*").size();
+        if (tagCount > 0) {
+            double textToTagRatio = (double) text.length() / tagCount;
+            score += textToTagRatio * 10;
+        }
+
+        return Math.max(0, score);
+    }
+
+    /**
+     * Check if element should be excluded from content
+     */
+    private static boolean isNonContentElement(Element element) {
+        String className = element.className().toLowerCase();
+        String id = element.id().toLowerCase();
+        String combined = className + " " + id;
+
+        for (Pattern pattern : NON_CONTENT_PATTERNS) {
+            if (pattern.matcher(combined).matches()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static Node convertElement(Element element) {
-        String tag = element.tagName();
-        if(SKIPPED_TAGS.contains(tag.toLowerCase())) {
+        String tag = element.tagName().toLowerCase();
+        if (SKIPPED_TAGS.contains(tag) || isNonContentElement(element)) {
             return null;
         }
 
         Node node = new Node(tag);
-        String ownText = element.ownText().trim();
-        if (!ownText.isEmpty()) {
-            node.text = ownText;
+
+        // Store href for links
+        if (tag.equals("a") && element.hasAttr("href")) {
+            node.attributes.put("href", element.attr("href"));
         }
 
+        // For elements that can contain mixed content (like paragraphs),
+        // we need to preserve the order of text and child elements
+        if (canContainMixedContent(tag)) {
+            processMixedContent(element, node);
+        } else {
+            // For other elements, use the original logic
+            String ownText = element.ownText().trim();
+            if (!ownText.isEmpty()) {
+                node.text = ownText;
+            }
 
-        // Process child elements
-        for (Element child : element.children()) {
-            Node childNode = convertElement(child);
-            if (childNode != null) {
-                node.children.add(childNode);
+            for (Element child : element.children()) {
+                Node childNode = convertElement(child);
+                if (childNode != null) {
+                    node.children.add(childNode);
+                }
             }
         }
+
         return node;
     }
 
-    /**
-     * Prunes the tree so that only nodes that contain non‑empty text or a media URL are kept.
-     * If a node is "empty" but has valid children, its valid children are promoted.
-     * The returned list is the pruned children of the given node.
-     */
+    private static boolean canContainMixedContent(String tag) {
+        return Arrays.asList("p", "div", "span", "td", "th", "blockquote", "em", "strong", "b", "i").contains(tag);
+    }
+
+    private static void processMixedContent(Element element, Node parentNode) {
+        // Process child nodes in order (both text nodes and elements)
+        for (org.jsoup.nodes.Node child : element.childNodes()) {
+            if (child instanceof org.jsoup.nodes.TextNode) {
+                org.jsoup.nodes.TextNode textNode = (org.jsoup.nodes.TextNode) child;
+                String text = textNode.text().trim();
+                if (!text.isEmpty()) {
+                    // Create a text node
+                    Node textChild = new Node("text");
+                    textChild.text = text;
+                    parentNode.children.add(textChild);
+                }
+            } else if (child instanceof Element) {
+                Element childElement = (Element) child;
+                Node childNode = convertElement(childElement);
+                if (childNode != null) {
+                    parentNode.children.add(childNode);
+                }
+            }
+        }
+    }
+
+    // Keep existing pruneTree methods...
     public static List<Node> pruneTree(Node node) {
         List<Node> pruned = new ArrayList<>();
         for (Node child : node.children) {
@@ -112,150 +240,231 @@ public class TextExtract {
     }
 
     private static List<Node> pruneTreeHelper(Node node) {
+        // Handle text nodes specially
+        if ("text".equals(node.tag)) {
+            if (node.text != null && !node.text.trim().isEmpty()) {
+                Node textNode = new Node("text");
+                textNode.text = node.text.trim();
+                return Arrays.asList(textNode);
+            }
+            return new ArrayList<>();
+        }
+
         List<Node> prunedChildren = new ArrayList<>();
         for (Node child : node.children) {
             prunedChildren.addAll(pruneTreeHelper(child));
         }
+
         boolean hasText = (node.text != null && !node.text.trim().isEmpty());
         boolean isHeading = HEADING_TAGS.contains(node.tag.toLowerCase());
+        boolean isImportantTag = MARKDOWN_FORMATTING.containsKey(node.tag.toLowerCase())
+                || isStructuralTag(node.tag);
 
-        // Keep nodes with text, media, heading tags, or special formatting
-        if (hasText || isHeading || MARKDOWN_FORMATTING.containsKey(node.tag.toLowerCase())) {
+        if (hasText || isHeading || isImportantTag || !prunedChildren.isEmpty()) {
             Node newNode = new Node(node.tag);
             newNode.text = hasText ? node.text.trim() : null;
             newNode.children = prunedChildren;
-            //newNode.attributes = node.attributes;
-            List<Node> list = new ArrayList<>();
-            list.add(newNode);
-            return list;
-        } else {
-            // Node itself is empty; promote its valid children.
-            return prunedChildren;
+            newNode.attributes = node.attributes;
+            return Arrays.asList(newNode);
         }
+
+        return prunedChildren;
     }
 
-    /**
-     * Converts a list of pruned Nodes to a JSON string.
-     */
+    private static boolean isStructuralTag(String tag) {
+        return Arrays.asList("div", "section", "p", "ul", "ol", "li", "blockquote").contains(tag.toLowerCase());
+    }
+
     public static String nodeListToJson(List<Node> nodes) throws Exception {
         ObjectMapper mapper = new ObjectMapper();
         return mapper.writerWithDefaultPrettyPrinter().writeValueAsString(nodes);
     }
 
     /**
-     * The renderer function takes the generated JSON string and outputs Markdown
-     * while preserving the hierarchical structure and properly handling heading tags.
+     * Improved Markdown rendering with consistent formatting
      */
     public static String renderToMarkdown(String json) throws Exception {
         ObjectMapper mapper = new ObjectMapper();
         List<Node> nodes = mapper.readValue(json, new TypeReference<List<Node>>() {});
+
         StringBuilder sb = new StringBuilder();
+        MarkdownRenderer renderer = new MarkdownRenderer();
+
         for (Node node : nodes) {
-            renderNodeMarkdown(node, sb, 0);
+            renderer.renderNode(node, sb, 0, false);
         }
-        return sb.toString();
+
+        return cleanupMarkdown(sb.toString());
     }
 
     /**
-     * Recursively renders a Node and its children as Markdown.
-     * Properly renders heading tags and maintains formatting.
+     * Separate renderer class for cleaner logic
      */
-    private static void renderNodeMarkdown(Node node, StringBuilder sb, int level) {
-        if (node == null) return;
+    private static class MarkdownRenderer {
 
-        String tagLower = node.tag.toLowerCase();
+        public void renderNode(Node node, StringBuilder sb, int listDepth, boolean inList) {
+            if (node == null) return;
 
-        // Handle heading tags (h1-h6)
-        if (HEADING_TAGS.contains(tagLower)) {
-            int headingLevel = Integer.parseInt(tagLower.substring(1));
-            String headingMarker = String.join("", Collections.nCopies(headingLevel, "#"));
+            String tag = node.tag.toLowerCase();
 
-            if (node.text != null && !node.text.isEmpty()) {
-                sb.append("\n\n").append(headingMarker).append(" ").append(node.text).append("\n\n");
+            // Handle headings
+            if (HEADING_TAGS.contains(tag)) {
+                renderHeading(node, sb);
+                return;
             }
 
-            // Render children of the heading
+            // Handle paragraphs
+            if (tag.equals("p")) {
+                renderParagraph(node, sb, listDepth, inList);
+                return;
+            }
+
+            // Handle lists
+            if (tag.equals("ul") || tag.equals("ol")) {
+                renderList(node, sb, listDepth, tag.equals("ol"));
+                return;
+            }
+
+            if (tag.equals("li")) {
+                renderListItem(node, sb, listDepth);
+                return;
+            }
+
+            // Handle formatted text
+            if (MARKDOWN_FORMATTING.containsKey(tag.toLowerCase())) {
+                renderFormattedText(node, sb, listDepth, inList);
+                return;
+            }
+
+            // Handle links
+            if (tag.equals("a")) {
+                renderLink(node, sb);
+                return;
+            }
+
+            // Handle blockquotes
+            if (tag.equals("blockquote")) {
+                renderBlockquote(node, sb);
+                return;
+            }
+
+            // Default: render children
             for (Node child : node.children) {
-                renderNodeMarkdown(child, sb, level);
+                renderNode(child, sb, listDepth, inList);
             }
-            return;
         }
 
-        // Handle paragraphs with proper spacing
-        if (tagLower.equals("p")) {
-            if (node.text != null && !node.text.isEmpty()) {
-                sb.append(node.text).append("\n\n");
-            }
+        private void renderHeading(Node node, StringBuilder sb) {
+            int level = Integer.parseInt(node.tag.substring(1));
+            String marker = String.join("", Collections.nCopies(level, "#"));
 
-            // Process children with their formatting
-            for (Node child : node.children) {
-                renderNodeMarkdown(child, sb, level);
-            }
-
-            return;
+            sb.append("\n\n").append(marker).append(" ");
+            appendTextContent(node, sb);
+            sb.append("\n\n");
         }
 
-        // Handle special formatting tags
-        if (MARKDOWN_FORMATTING.containsKey(tagLower)) {
-            String[] formatting = MARKDOWN_FORMATTING.get(tagLower);
+        private void renderParagraph(Node node, StringBuilder sb, int listDepth, boolean inList) {
+            if (!inList) sb.append("\n");
 
-            if (node.text != null && !node.text.isEmpty()) {
-                sb.append(formatting[0]).append(node.text);
-                sb.append(formatting[1]);
-                sb.append(" ");
-            }
-
-            // Process children with their formatting
+            // Render children in order (now includes text nodes)
             for (Node child : node.children) {
-                renderNodeMarkdown(child, sb, level);
+                if ("text".equals(child.tag)) {
+                    // This is a text node
+                    sb.append(child.text);
+                } else {
+                    renderNode(child, sb, listDepth, inList);
+                }
             }
 
-            return;
+            // No need to append node.text separately since it's now handled in children
+
+            if (!inList) sb.append("\n\n");
         }
 
-        // Handle lists (ul/ol/li)
-        if (tagLower.equals("ul") || tagLower.equals("ol")) {
-            // Process list items with appropriate indentation
+        private void renderList(Node node, StringBuilder sb, int listDepth, boolean ordered) {
+            sb.append("\n");
             for (Node child : node.children) {
-                renderNodeMarkdown(child, sb, level + 1);
+                renderNode(child, sb, listDepth, true);
             }
             sb.append("\n");
-            return;
         }
 
-        if (tagLower.equals("li")) {
-            int displayLevel = Math.min(level, 6);
-            String indent = String.join("", Collections.nCopies(Math.max(0, displayLevel - 1) * 2, " "));
+        private void renderListItem(Node node, StringBuilder sb, int listDepth) {
+            String indent = String.join("", Collections.nCopies(listDepth * 2, " "));
+            sb.append(indent).append("- ");
 
-            if (node.text != null && !node.text.isEmpty()) {
-                sb.append(indent).append("- ").append(node.text).append("\n");
+            // Handle mixed content structure
+            if (hasTextNodes(node)) {
+                // New mixed content structure
+                for (Node child : node.children) {
+                    if ("text".equals(child.tag)) {
+                        sb.append(child.text);
+                    } else {
+                        renderNode(child, sb, listDepth, true);
+                    }
+                }
             } else {
-                sb.append(indent).append("- ");
+                // Traditional structure
+                appendTextContent(node, sb);
             }
 
-            // Process child elements
+            sb.append("\n");
+        }
+
+        private boolean hasTextNodes(Node node) {
+            return node.children.stream().anyMatch(child -> "text".equals(child.tag));
+        }
+
+        private String[] getMarkdownFormatting(String tag) {
+            String[] formatting = MARKDOWN_FORMATTING.get(tag.toLowerCase());
+            if (formatting == null || formatting.length < 2) {
+                return new String[]{"", ""}; // Return empty strings as fallback
+            }
+            return formatting;
+        }
+
+        private void renderFormattedText(Node node, StringBuilder sb, int listDepth, boolean inList) {
+            String[] formatting = getMarkdownFormatting(node.tag);
+            sb.append(formatting[0]);
+            appendTextContent(node, sb);
+            sb.append(formatting[1]);
+        }
+
+        private void renderLink(Node node, StringBuilder sb) {
+            sb.append("[");
+            appendTextContent(node, sb);
+            sb.append("]");
+
+            String href = node.attributes.get("href");
+            if (href != null && !href.isEmpty()) {
+                sb.append("(").append(href).append(")");
+            }
+        }
+
+        private void renderBlockquote(Node node, StringBuilder sb) {
+            sb.append("\n> ");
+            appendTextContent(node, sb);
+            sb.append("\n\n");
+        }
+
+        private void appendTextContent(Node node, StringBuilder sb) {
+            if (node.text != null && !node.text.isEmpty()) {
+                sb.append(node.text);
+            }
+
             for (Node child : node.children) {
-                renderNodeMarkdown(child, sb, level + 1);
+                renderNode(child, sb, 0, false);
             }
-
-            return;
         }
+    }
 
-        // Default case: render text content with indentation for other elements
-        if (node.text != null && !node.text.isEmpty()) {
-            int displayLevel = Math.min(level, 6);
-            String indent = String.join("", Collections.nCopies(displayLevel * 2, " "));
-
-            if (level > 0) {
-                sb.append(indent).append("- ");
-            }
-
-            sb.append(node.text).append("\n");
-        }
-
-        // Process child elements
-        for (Node child : node.children) {
-            renderNodeMarkdown(child, sb, level + 1);
-        }
+    /**
+     * Clean up the final markdown output
+     */
+    private static String cleanupMarkdown(String markdown) {
+        return markdown
+                .replaceAll("\n{3,}", "\n\n")  // Remove excessive newlines
+                .replaceAll("(?m)^\\s+$", "")   // Remove whitespace-only lines
+                .trim();
     }
 }
